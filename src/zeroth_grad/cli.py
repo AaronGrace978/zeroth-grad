@@ -34,6 +34,20 @@ def _load_phi(args: argparse.Namespace, d_in: int) -> tuple[torch.Tensor, int]:
     return phi.view(-1).float(), int(args.head)
 
 
+def _merge_paths(args: argparse.Namespace) -> list[Path]:
+    if args.ckpts:
+        if args.ckpt_a is not None or args.ckpt_b:
+            raise SystemExit("merge takes either --ckpts or --ckpt-a/--ckpt-b, not both")
+        paths = list(args.ckpts)
+    else:
+        if args.ckpt_a is None or not args.ckpt_b:
+            raise SystemExit("merge needs --ckpt-a and --ckpt-b, or --ckpts")
+        paths = [args.ckpt_a, *args.ckpt_b]
+    if len(paths) < 2:
+        raise SystemExit("merge needs at least two checkpoints")
+    return paths
+
+
 def _cmd_populate(args: argparse.Namespace) -> None:
     from zeroth_grad.zoo import populate
 
@@ -118,14 +132,15 @@ def _compile(args: argparse.Namespace) -> None:
             meta["h2"] = str(edited["w2"].shape[0])
             save_checkpoint(args.out, edited, meta)
         elif args.op == "merge":
-            left, meta_a = load_checkpoint(args.ckpt_a)
-            right, meta_b = load_checkpoint(args.ckpt_b)
-            edited = compiler.merge(left, right)
-            skills = sorted(set(parse_skills(meta_a.get("skills", "")) + parse_skills(meta_b.get("skills", ""))))
-            meta = dict(meta_a)
+            paths = _merge_paths(args)
+            loaded = [load_checkpoint(path) for path in paths]
+            edited = compiler.merge_many([weights for weights, _ in loaded])
+            skills = sorted({skill for _, meta in loaded for skill in parse_skills(meta.get("skills", ""))})
+            meta = dict(loaded[0][1])
             meta["edit"] = "merge"
             meta["skills"] = format_skills(skills)
             meta["kind"] = "merged"
+            meta["parents"] = str(len(paths))
             save_checkpoint(args.out, edited, meta)
         else:
             raise SystemExit(f"unknown compile op {args.op}")
@@ -170,7 +185,8 @@ def main(argv: list[str] | None = None) -> None:
     compile_parser.add_argument("--compiler", type=Path, default=Path("runs/compiler.pt"))
     compile_parser.add_argument("--ckpt", type=Path)
     compile_parser.add_argument("--ckpt-a", type=Path)
-    compile_parser.add_argument("--ckpt-b", type=Path)
+    compile_parser.add_argument("--ckpt-b", type=Path, nargs="+", help="one or more checkpoints merged into --ckpt-a, in order")
+    compile_parser.add_argument("--ckpts", type=Path, nargs="+", help="checkpoints to merge, folded left to right")
     compile_parser.add_argument("--out", type=Path, required=True)
     compile_parser.add_argument("--examples", type=Path)
     compile_parser.add_argument("--phi", type=Path)

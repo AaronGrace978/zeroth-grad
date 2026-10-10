@@ -77,3 +77,19 @@ def test_cli_widen_and_compile_roundtrip_shapes(tmp_path):
     _, injected_meta = load_checkpoint(injected)
     assert injected_meta["edit"] == "inject"
     assert injected_meta["head"] == "3"
+
+    others = []
+    for index, skill in enumerate((1, 2)):
+        path = tmp_path / f"other{index}.pt"
+        save_checkpoint(path, shared_init(seed=6 + index, h=8, d_out=8), {"skills": str(skill)})
+        others.append(str(path))
+    merged = tmp_path / "merged.safetensors"
+    main(["compile", "merge", "--compiler", str(compiler_path), "--ckpts", str(src), *others, "--out", str(merged)])
+    merged_weights, merged_meta = load_checkpoint(merged)
+    assert merged_weights["w1"].shape == weights["w1"].shape
+    assert merged_meta["edit"] == "merge"
+    assert merged_meta["skills"] == "0,1,2"
+    assert merged_meta["parents"] == "3"
+    pair = tmp_path / "pair.safetensors"
+    main(["compile", "merge", "--compiler", str(compiler_path), "--ckpt-a", str(src), "--ckpt-b", others[0], "--out", str(pair)])
+    assert load_checkpoint(pair)[1]["skills"] == "0,1"
