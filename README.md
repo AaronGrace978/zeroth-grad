@@ -28,7 +28,9 @@ The zoo is trained from one shared initialization. Skills 0–5 are the training
 
 ## Results
 
-Held-out checkpoints, CPU, after `populate --steps 300` and `train --steps 400`. Accuracy is mean sign agreement on 2,500–3,000 fresh samples. The full dump is written to `runs/metrics.json`.
+Held-out checkpoints, CPU, after `populate --steps 300` and `train --steps 400`. Accuracy is mean sign agreement on 2,500–3,000 fresh samples. The full dump is written to `runs/metrics.json`. `python scripts/plot_results.py` redraws the figure below.
+
+![Held-out accuracies for inject, compress, and merge](docs/heldout_results.png)
 
 **Inject** (24 edits: 12 held-out models × skills 6 and 7):
 
