@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+plot = ["matplotlib"]
 
 [project.scripts]
 zeroth-grad = "zeroth_grad.cli:main"
