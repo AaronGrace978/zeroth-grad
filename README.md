@@ -4,6 +4,8 @@ A weight-space compiler. It reads a small MLP checkpoint (`.safetensors` or `.pt
 
 The compiler itself is trained. Each step samples a checkpoint from a zoo of models trained on synthetic halfspaces, applies an edit, and backpropagates a functional loss into the compiler only. At apply time the checkpoint tensors are constants.
 
+![A checkpoint goes into the weight compiler, which compresses, injects, or merges it](docs/weight-compiler-diagram.jpg)
+
 ## Edit families
 
 Hidden units are a set. Permuting a layer permutes that layer's tokens and leaves the other layer's tokens in place, because messages between layers are products with the weight matrix (`W @ features`), not a flattened parameter vector.
