@@ -27,6 +27,20 @@ def test_cli_help():
         assert exc.code == 0
 
 
+def test_cli_prior_merge_sizes_the_compiler_to_the_checkpoints(tmp_path):
+    paths = []
+    for skill in range(3):
+        path = tmp_path / f"wide_input{skill}.safetensors"
+        save_checkpoint(path, shared_init(seed=skill, d_in=64, h=16, d_out=10), {"skills": str(skill)})
+        paths.append(str(path))
+    out = tmp_path / "merged.safetensors"
+    main(["compile", "merge", "--prior", "--ckpts", *paths, "--out", str(out)])
+    merged, meta = load_checkpoint(out)
+    assert merged["w1"].shape == (16, 64)
+    assert merged["w3"].shape == (10, 16)
+    assert meta["skills"] == "0,1,2"
+
+
 def test_cli_widen_and_compile_roundtrip_shapes(tmp_path):
     concepts = concept_bank(0)
     weights = shared_init(seed=5, h=8, d_out=8)
