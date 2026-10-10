@@ -1,0 +1,29 @@
+[project]
+name = "zeroth-grad"
+version = "0.1.0"
+description = "Compile checkpoint edits in weight space, without backpropagation on the target."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "safetensors",
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+zeroth-grad = "zeroth_grad.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
