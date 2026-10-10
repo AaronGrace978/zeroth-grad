@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+plot = ["matplotlib"]
 
 [project.scripts]
 zeroth-grad = "zeroth_grad.cli:main"
@@ -26,4 +27,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

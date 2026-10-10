@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import combinations
 from pathlib import Path
 
 import torch
@@ -63,12 +64,14 @@ def finetune_oracle(
     steps: int = 200,
     lr: float = 0.05,
     batch_size: int = 256,
+    seed: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Adam on the target checkpoint for `steps` steps. A ceiling, not the compiler."""
     params = {key: value.clone().detach().requires_grad_(True) for key, value in weights.items()}
     opt = torch.optim.Adam(params.values(), lr=lr)
+    generator = torch.Generator().manual_seed(seed)
     for _ in range(steps):
-        x = torch.randn(batch_size, concepts.shape[1])
+        x = torch.randn(batch_size, concepts.shape[1], generator=generator)
         logits = functional_mlp(params, x)
         loss = F.binary_cross_entropy_with_logits(logits[:, tgt], skill_labels(x, concepts[tgt]))
         loss = loss + F.binary_cross_entropy_with_logits(logits[:, src], skill_labels(x, concepts[src]))
@@ -100,7 +103,7 @@ def evaluate_inject(
             trained_rows.append(_inject_case(compiler, record.weights, concepts, src, tgt, n))
             fresh_rows.append(_inject_case(fresh, record.weights, concepts, src, tgt, n))
             if oracle_limit is None or seen < oracle_limit:
-                edited = finetune_oracle(record.weights, concepts, src, tgt)
+                edited = finetune_oracle(record.weights, concepts, src, tgt, seed=seen)
                 oracle_new.append(head_accuracy(edited, concepts, tgt, n=n, seed=2))
                 seen += 1
     return {
@@ -150,6 +153,20 @@ def _merge_accuracies(
     return _pair_accuracy(weights, concepts, heads, n=n, seed=4)
 
 
+def _heldout_by_seed(records: list[Record]) -> dict[str, list[Record]]:
+    heldout = [r for r in records if r.split == "heldout" and r.kind == "single"]
+    by_seed: dict[str, list[Record]] = {}
+    for record in heldout:
+        by_seed.setdefault(record.metadata["seed"], []).append(record)
+    return by_seed
+
+
+def _source_accuracy(group: list[Record], concepts: torch.Tensor, n: int) -> float:
+    """Each source checkpoint on its own skill: the ceiling for a merge of `group`."""
+    return _mean([head_accuracy(r.weights, concepts, r.skills[0], n=n, seed=4) for r in group])
+
+
+@torch.no_grad()
 def evaluate_merge(
     compiler: WeightCompiler,
     records: list[Record],
@@ -157,18 +174,18 @@ def evaluate_merge(
     n: int = 2500,
 ) -> dict[str, float]:
     compiler.eval()
-    heldout = [r for r in records if r.split == "heldout" and r.kind == "single"]
-    by_seed: dict[str, list[Record]] = {}
-    for record in heldout:
-        by_seed.setdefault(record.metadata["seed"], []).append(record)
+    fresh = WeightCompiler(d_in=compiler.d_in, d_out=compiler.d_out, d_model=compiler.d_model)
+    fresh.eval()
     compiler_scores = []
+    prior_scores = []
+    source_scores = []
     unaligned_scores = []
     aligned_soup_scores = []
     norm_gate_scores = []
     perm_compiler = []
     perm_unaligned = []
     pairs = 0
-    for seed, group in sorted(by_seed.items()):
+    for seed, group in sorted(_heldout_by_seed(records).items()):
         for i, left in enumerate(group):
             for right in group[i + 1 :]:
                 if left.skills[0] == right.skills[0]:
@@ -176,6 +193,8 @@ def evaluate_merge(
                 heads = [left.skills[0], right.skills[0]]
                 merged = compiler.merge(left.weights, right.weights)
                 compiler_scores.append(_merge_accuracies(merged, concepts, heads, n))
+                prior_scores.append(_merge_accuracies(fresh.merge(left.weights, right.weights), concepts, heads, n))
+                source_scores.append(_source_accuracy([left, right], concepts, n))
                 unaligned_scores.append(_merge_accuracies(uniform_average(left.weights, right.weights), concepts, heads, n))
                 aligned = align_to(left.weights, right.weights)
                 aligned_soup_scores.append(_merge_accuracies(uniform_average(left.weights, aligned), concepts, heads, n))
@@ -192,6 +211,8 @@ def evaluate_merge(
     return {
         "n": float(pairs),
         "compiler_acc": _mean(compiler_scores),
+        "routed_prior_acc": _mean(prior_scores),
+        "source_acc": _mean(source_scores),
         "unaligned_acc": _mean(unaligned_scores),
         "aligned_soup_acc": _mean(aligned_soup_scores),
         "norm_gate_acc": _mean(norm_gate_scores),
@@ -200,17 +221,71 @@ def evaluate_merge(
     }
 
 
+def aligned_soup_many(checkpoints: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Align every checkpoint to the first and average them uniformly."""
+    reference = checkpoints[0]
+    aligned = [reference] + [align_to(reference, other) for other in checkpoints[1:]]
+    return {key: torch.stack([w[key] for w in aligned]).mean(dim=0) for key in reference}
+
+
+@torch.no_grad()
+def evaluate_merge_many(
+    compiler: WeightCompiler,
+    records: list[Record],
+    concepts: torch.Tensor,
+    sizes: tuple[int, ...] = (2, 3, 4, 5, 6),
+    n: int = 2500,
+) -> dict[str, dict[str, float]]:
+    """Fold k held-out single-skill checkpoints of one seed into one network.
+
+    Every k-subset of distinct skills is merged. Accuracy is the mean over the
+    k merged skills. As k grows the live units of all parents stop fitting in
+    the hidden width, and slots start to collide.
+    """
+    compiler.eval()
+    fresh = WeightCompiler(d_in=compiler.d_in, d_out=compiler.d_out, d_model=compiler.d_model)
+    fresh.eval()
+    out: dict[str, dict[str, float]] = {}
+    groups = []
+    for _, group in sorted(_heldout_by_seed(records).items()):
+        by_skill: dict[int, Record] = {}
+        for record in group:
+            by_skill.setdefault(record.skills[0], record)
+        groups.append([by_skill[s] for s in sorted(by_skill)])
+    for k in sizes:
+        compiler_scores, prior_scores, soup_scores, source_scores = [], [], [], []
+        for group in groups:
+            for subset in combinations(group, k):
+                heads = [r.skills[0] for r in subset]
+                weights = [r.weights for r in subset]
+                compiler_scores.append(_pair_accuracy(compiler.merge_many(weights), concepts, heads, n=n, seed=4))
+                prior_scores.append(_pair_accuracy(fresh.merge_many(weights), concepts, heads, n=n, seed=4))
+                soup_scores.append(_pair_accuracy(aligned_soup_many(weights), concepts, heads, n=n, seed=4))
+                source_scores.append(_source_accuracy(list(subset), concepts, n))
+        if not compiler_scores:
+            continue
+        out[str(k)] = {
+            "n": float(len(compiler_scores)),
+            "compiler_acc": _mean(compiler_scores),
+            "routed_prior_acc": _mean(prior_scores),
+            "aligned_soup_acc": _mean(soup_scores),
+            "source_acc": _mean(source_scores),
+        }
+    return out
+
+
 def evaluate_all(
     compiler: WeightCompiler,
     checkpoint_dir: str | Path,
     out: str | Path | None = None,
-) -> dict[str, dict[str, float]]:
+) -> dict[str, dict]:
     concepts = load_concepts(checkpoint_dir)
     records = load_zoo(checkpoint_dir)
     metrics = {
         "inject": evaluate_inject(compiler, records, concepts),
         "compress": evaluate_compress(compiler, records, concepts),
         "merge": evaluate_merge(compiler, records, concepts),
+        "merge_many": evaluate_merge_many(compiler, records, concepts),
     }
     if out is not None:
         path = Path(out)
