@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from zeroth_grad.align import permute_h1, permute_h2
 from zeroth_grad.compiler import WeightCompiler
 from zeroth_grad.data import skill_labels
-from zeroth_grad.edit import expand_h1, expand_h2
+from zeroth_grad.edit import expand_h1, expand_h2, mix_checkpoints
 from zeroth_grad.mlp import functional_mlp
 from zeroth_grad.zoo import Record, load_concepts, load_zoo
 
@@ -124,19 +124,15 @@ def train_compiler(
             left = train_records[int(torch.randint(len(train_records), (1,), generator=generator).item())]
             right_choices = [r for r in train_records if r.skills[0] != left.skills[0]]
             right = right_choices[int(torch.randint(len(right_choices), (1,), generator=generator).item())]
-            edited = compiler.merge(left.weights, right.weights)
-            # Residual is the merge head's pre-activation. Re-encode the aligned pair
-            # only through the parameters, via a second merge_lambdas call's graph.
-            # The edited weights already carry that graph; penalize head weights lightly
-            # by running the head on detached features so the prior remains the default.
-            with torch.no_grad():
-                from zeroth_grad.align import align_to
-
-                aligned = align_to(left.weights, right.weights)
-            f1a, f2a = compiler.encode(left.weights, task=2)
-            f1b, f2b = compiler.encode(aligned, task=2)
-            reg = _residual_norm(compiler.merge1, torch.cat([f1a, f1b], dim=-1))
-            reg = reg + _residual_norm(compiler.merge2, torch.cat([f2a, f2b], dim=-1))
+            lam1, lam2, lam3, aligned = compiler.merge_lambdas(left.weights, right.weights)
+            edited = mix_checkpoints(left.weights, aligned, lam1, lam2, lam3)
+            # Keep the residual heads small so the geometric prior stays the default.
+            pair1, pair2, pair3 = compiler.merge_features(left.weights, aligned)
+            reg = (
+                _residual_norm(compiler.merge1, pair1)
+                + _residual_norm(compiler.merge2, pair2)
+                + _residual_norm(compiler.merge3, pair3)
+            )
             loss = 0.5 * (
                 _bce_on(edited, x, concepts, left.skills[0]) + _bce_on(edited, x, concepts, right.skills[0])
             )
@@ -152,8 +148,12 @@ def train_compiler(
                 float(F.softplus(compiler.alpha_raw).detach()),
                 float(F.softplus(compiler.r_raw).detach()),
                 float(compiler.db3_raw.detach()),
+                float(F.softplus(compiler.head_temp_raw).detach()),
             )
-            print(f"step {step:4d} op={op:8s} loss={losses[-1]:.4f} alpha={scales[0]:.2f} readout={scales[1]:.2f} db3={scales[2]:.2f}")
+            print(
+                f"step {step:4d} op={op:8s} loss={losses[-1]:.4f} alpha={scales[0]:.2f} "
+                f"readout={scales[1]:.2f} db3={scales[2]:.2f} head_temp={scales[3]:.2f}"
+            )
     return losses
 
 
@@ -174,7 +174,12 @@ def save_compiler(path: str | Path, compiler: WeightCompiler) -> None:
 def load_compiler(path: str | Path) -> WeightCompiler:
     blob = torch.load(path, map_location="cpu", weights_only=False)
     compiler = WeightCompiler(d_in=blob["d_in"], d_out=blob["d_out"], d_model=blob["d_model"])
-    compiler.load_state_dict(blob["state_dict"])
+    # Compilers saved before head routing lack these; their defaults are the geometric prior.
+    optional = {"merge3.weight", "merge3.bias", "head_temp_raw"}
+    result = compiler.load_state_dict(blob["state_dict"], strict=False)
+    missing = set(result.missing_keys) - optional
+    if missing or result.unexpected_keys:
+        raise RuntimeError(f"compiler state mismatch: missing={sorted(missing)} unexpected={result.unexpected_keys}")
     compiler.eval()
     return compiler
 

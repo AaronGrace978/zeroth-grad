@@ -264,13 +264,34 @@ def inv_sigmoid(p: torch.Tensor) -> torch.Tensor:
     return torch.log(p) - torch.log1p(-p)
 
 
+def head_norm(weights: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Readout row norm per output head."""
+    return weights["w3"].norm(dim=1)
+
+
+def head_owner_logit(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor], eps: float = 1e-8) -> torch.Tensor:
+    """log(|w3_a[k]| / |w3_b[k]|). Positive where `a` has the stronger readout for head k.
+
+    sigmoid(tau * logit) equals norm_prior(|a|**tau, |b|**tau), so tau sharpens
+    the readout-norm ratio into an ownership gate.
+    """
+    return torch.log(head_norm(a).clamp_min(eps)) - torch.log(head_norm(b).clamp_min(eps))
+
+
 def mix_checkpoints(
     a: dict[str, torch.Tensor],
     b: dict[str, torch.Tensor],
     lam1: torch.Tensor,
     lam2: torch.Tensor,
+    lam3: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Mix two aligned checkpoints. lam is the weight on `a`."""
+    """Mix two aligned checkpoints. lam is the weight on `a`.
+
+    lam3 is per-head ownership. With lam3, the same-parent rule also covers
+    the readout: head k reads a hidden unit only when both come from the same
+    parent. Without it, every head reads every unit and b3 follows the
+    readout-norm ratio.
+    """
     lam1 = lam1.view(-1)
     lam2 = lam2.view(-1)
     w1 = lam1[:, None] * a["w1"] + (1 - lam1)[:, None] * b["w1"]
@@ -281,9 +302,15 @@ def mix_checkpoints(
     use_b = (1 - lam2)[:, None] * (1 - lam1)[None, :]
     w2 = use_a * a["w2"] + use_b * b["w2"]
     b2 = lam2 * a["b2"] + (1 - lam2) * b["b2"]
-    w3 = lam2[None, :] * a["w3"] + (1 - lam2)[None, :] * b["w3"]
-    head_a = a["w3"].norm(dim=1)
-    head_b = b["w3"].norm(dim=1)
-    lam_head = head_a / (head_a + head_b + 1e-8)
+    if lam3 is None:
+        w3 = lam2[None, :] * a["w3"] + (1 - lam2)[None, :] * b["w3"]
+        head_a = head_norm(a)
+        head_b = head_norm(b)
+        lam_head = head_a / (head_a + head_b + 1e-8)
+    else:
+        lam_head = lam3.view(-1)
+        read_a = lam_head[:, None] * lam2[None, :]
+        read_b = (1 - lam_head)[:, None] * (1 - lam2)[None, :]
+        w3 = read_a * a["w3"] + read_b * b["w3"]
     b3 = lam_head * a["b3"] + (1 - lam_head) * b["b3"]
     return {"w1": w1, "b1": b1, "w2": w2, "b2": b2, "w3": w3, "b3": b3}

@@ -3,7 +3,8 @@
 Hidden units are a set. Layer messages are products with the weight matrices,
 so permuting a layer permutes that layer's tokens and leaves the other layer
 unchanged. Heads predict a residual on a geometric edit: duplicate collapse,
-a rank-1 write onto spare neurons, or a norm-gated mix after alignment.
+a rank-1 write onto spare neurons, or a norm-gated mix after alignment with
+per-head readout ownership.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from zeroth_grad.edit import (
     cosine_matrix,
     h1_features,
     h2_features,
+    head_owner_logit,
     inv_sigmoid,
     mix_checkpoints,
     neuron_norm_h1,
@@ -72,12 +74,14 @@ class WeightCompiler(nn.Module):
         self.db2_head = nn.Linear(d_model, 1)
         self.merge1 = nn.Linear(d_model * 2, 1)
         self.merge2 = nn.Linear(d_model * 2, 1)
+        self.merge3 = nn.Linear(d_model * 2, 1)
 
         self.alpha_raw = nn.Parameter(torch.tensor(_softplus_inverse(1.0)))
         self.s_raw = nn.Parameter(torch.tensor(_softplus_inverse(1.0)))
         self.c_raw = nn.Parameter(torch.tensor(_softplus_inverse(1.0)))
         self.r_raw = nn.Parameter(torch.tensor(_softplus_inverse(1.0)))
         self.db3_raw = nn.Parameter(torch.tensor(-0.5))
+        self.head_temp_raw = nn.Parameter(torch.tensor(_softplus_inverse(4.0)))
 
         for head in (
             self.keep1,
@@ -90,11 +94,12 @@ class WeightCompiler(nn.Module):
             self.db2_head,
             self.merge1,
             self.merge2,
+            self.merge3,
         ):
             _zero_linear(head)
 
     def scale_parameters(self) -> list[nn.Parameter]:
-        return [self.alpha_raw, self.s_raw, self.c_raw, self.r_raw, self.db3_raw]
+        return [self.alpha_raw, self.s_raw, self.c_raw, self.r_raw, self.db3_raw, self.head_temp_raw]
 
     def _condition(self, task: int, phi: torch.Tensor | None, target_head: int | None, batch_device: torch.device) -> torch.Tensor:
         cond = self.task_embed.weight[task]
@@ -221,27 +226,52 @@ class WeightCompiler(nn.Module):
             replace_head=True,
         )
 
+    def merge_features(
+        self,
+        weights_a: dict[str, torch.Tensor],
+        aligned_b: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Paired (h1, h2, head) features for the merge heads. `aligned_b` is already aligned to `a`."""
+        f1a, f2a = self.encode(weights_a, task=2)
+        f1b, f2b = self.encode(aligned_b, task=2)
+        pair1 = torch.cat([f1a, f1b], dim=-1)
+        pair2 = torch.cat([f2a, f2b], dim=-1)
+        pair3 = torch.cat([_head_tokens(weights_a, f2a), _head_tokens(aligned_b, f2b)], dim=-1)
+        return pair1, pair2, pair3
+
     def merge_lambdas(
         self,
         weights_a: dict[str, torch.Tensor],
         weights_b: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Return (lam1, lam2, lam3, aligned_b). Each lam is the weight on `a`; lam3 is per output head."""
         aligned = align_to(weights_a, weights_b)
-        f1a, f2a = self.encode(weights_a, task=2)
-        f1b, f2b = self.encode(aligned, task=2)
+        pair1, pair2, pair3 = self.merge_features(weights_a, aligned)
         prior1 = norm_prior(neuron_norm_h1(weights_a), neuron_norm_h1(aligned)).detach()
         prior2 = norm_prior(neuron_norm_h2(weights_a), neuron_norm_h2(aligned)).detach()
-        raw1 = self.merge1(torch.cat([f1a, f1b], dim=-1)).squeeze(-1)
-        raw2 = self.merge2(torch.cat([f2a, f2b], dim=-1)).squeeze(-1)
+        owner = head_owner_logit(weights_a, aligned).detach()
+        raw1 = self.merge1(pair1).squeeze(-1)
+        raw2 = self.merge2(pair2).squeeze(-1)
+        raw3 = self.merge3(pair3).squeeze(-1)
         lam1 = torch.sigmoid(inv_sigmoid(prior1) + raw1)
         lam2 = torch.sigmoid(inv_sigmoid(prior2) + raw2)
-        return lam1, lam2, aligned
+        lam3 = torch.sigmoid(torch.nn.functional.softplus(self.head_temp_raw) * owner + raw3)
+        return lam1, lam2, lam3, aligned
 
     def merge(self, weights_a: dict[str, torch.Tensor], weights_b: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         a = clone_weights(weights_a)
         b = clone_weights(weights_b)
-        lam1, lam2, aligned = self.merge_lambdas(a, b)
-        return mix_checkpoints(a, aligned, lam1, lam2)
+        lam1, lam2, lam3, aligned = self.merge_lambdas(a, b)
+        return mix_checkpoints(a, aligned, lam1, lam2, lam3)
+
+    def merge_many(self, checkpoints: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        """Fold merge left to right: merge(merge(merge(c0, c1), c2), ...)."""
+        if not checkpoints:
+            raise ValueError("merge_many needs at least one checkpoint")
+        merged = clone_weights(checkpoints[0])
+        for other in checkpoints[1:]:
+            merged = self.merge(merged, other)
+        return merged
 
 
 def _encoder_layer(d_model: int, nhead: int) -> nn.TransformerEncoderLayer:
@@ -254,6 +284,16 @@ def _encoder_layer(d_model: int, nhead: int) -> nn.TransformerEncoderLayer:
         norm_first=True,
         activation="gelu",
     )
+
+
+def _head_tokens(weights: dict[str, torch.Tensor], f2: torch.Tensor) -> torch.Tensor:
+    """One token per output head: hidden-2 tokens pooled by that head's readout direction.
+
+    The sum runs over hidden-2 units, so the tokens do not depend on their order.
+    """
+    w3 = weights["w3"]
+    direction = w3 / w3.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    return direction @ f2
 
 
 def _duplicate_penalty(features: torch.Tensor, cosine_min: float = 0.999) -> torch.Tensor:
