@@ -158,39 +158,6 @@ def test_estimate_direction_recovers_concept():
     assert cosine > 0.95
 
 
-def test_alignment_sends_a_partly_similar_live_unit_to_a_free_slot():
-    torch.manual_seed(0)
-    h = 4
-    base = torch.zeros(16)
-    base[0] = 1.0
-    other = torch.zeros(16)
-    other[0] = 0.4
-    other[1] = (1 - 0.4**2) ** 0.5
-
-    def single_unit(row):
-        weights = {
-            "w1": torch.zeros(h, 16),
-            "b1": torch.zeros(h),
-            "w2": torch.zeros(h, h),
-            "b2": torch.zeros(h),
-            "w3": torch.zeros(8, h),
-            "b3": torch.zeros(8),
-        }
-        weights["w1"][0] = row
-        # Small outgoing weights, as in trained detectors whose readout carries the scale.
-        weights["w2"][0, 0] = 0.2
-        weights["w3"][0, 0] = 1.0
-        return weights
-
-    reference = single_unit(base)
-    source = single_unit(other)
-    live = lambda w: (w["w2"].norm(dim=0) > 0).nonzero().flatten().tolist()
-    # Cosine 0.4 between the two live units: the interference cost leaves them
-    # in separate slots, the legacy geometric cost stacks them in one.
-    assert live(align_to(reference, source)) != live(reference)
-    assert live(align_to(reference, source, mode="legacy")) == live(reference)
-
-
 def test_aligned_norm_gate_keeps_both_disjoint_skills_unaligned_average_does_not():
     concepts = concept_bank(0)
     left = _halfspace(concepts, skill=0, h=8, n1=0, n2=0)

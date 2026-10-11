@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
 
-from zeroth_grad.compiler import WeightCompiler
 from zeroth_grad.data import estimate_direction, format_skills, parse_skills
 from zeroth_grad.edit import expand_h1, expand_h2
 from zeroth_grad.io import load_checkpoint, save_checkpoint
@@ -70,28 +68,6 @@ def _cmd_eval(args: argparse.Namespace) -> None:
     print(Path(args.out).read_text())
 
 
-def _cmd_digits_populate(args: argparse.Namespace) -> None:
-    from zeroth_grad.digits import populate_digits
-
-    populate_digits(
-        args.out,
-        hidden=args.hidden,
-        steps=args.steps,
-        sparsity=args.sparsity,
-        seeds=tuple(range(args.seeds)),
-        data_seed=args.data_seed,
-    )
-
-
-def _cmd_digits_eval(args: argparse.Namespace) -> None:
-    from zeroth_grad.digits import evaluate_digits
-
-    compiler = load_compiler(args.compiler) if args.compiler is not None else None
-    metrics = evaluate_digits(args.checkpoints, compiler=compiler, out=args.out, subsets_per_size=args.subsets)
-    summary = {key: metrics[key] for key in ("width", "seeds", "ten_way", "merge_k")}
-    print(json.dumps(summary, indent=2))
-
-
 def _cmd_widen(args: argparse.Namespace) -> None:
     weights, meta = load_checkpoint(args.ckpt)
     base_h1 = meta.get("base_h1", str(weights["w1"].shape[0]))
@@ -123,16 +99,8 @@ def _cmd_widen(args: argparse.Namespace) -> None:
     print(f"wrote {args.out} h1={meta['h1']} h2={meta['h2']} base_h1={meta.get('base_h1')}")
 
 
-def _prior_compiler(args: argparse.Namespace) -> WeightCompiler:
-    """Untrained compiler sized to the checkpoint: the geometric prior with no learned residual."""
-    if args.op != "merge":
-        raise SystemExit("--prior applies to compile merge only")
-    weights, _ = load_checkpoint(_merge_paths(args)[0])
-    return WeightCompiler(d_in=int(weights["w1"].shape[1]), d_out=int(weights["w3"].shape[0]))
-
-
 def _compile(args: argparse.Namespace) -> None:
-    compiler = _prior_compiler(args) if args.prior else load_compiler(args.compiler)
+    compiler = load_compiler(args.compiler)
     compiler.eval()
     with torch.no_grad():
         if args.op == "inject":
@@ -202,22 +170,6 @@ def main(argv: list[str] | None = None) -> None:
     evaluate.add_argument("--out", type=Path, default=Path("runs/metrics.json"))
     evaluate.set_defaults(func=_cmd_eval)
 
-    digits_populate = sub.add_parser("digits-populate", help="Train sparse one-vs-rest detectors on 8x8 digits")
-    digits_populate.add_argument("--out", type=Path, default=Path("digits"))
-    digits_populate.add_argument("--hidden", type=int, default=64)
-    digits_populate.add_argument("--steps", type=int, default=400)
-    digits_populate.add_argument("--sparsity", type=float, default=3e-3)
-    digits_populate.add_argument("--seeds", type=int, default=3, help="number of detector seeds")
-    digits_populate.add_argument("--data-seed", type=int, default=0)
-    digits_populate.set_defaults(func=_cmd_digits_populate)
-
-    digits_eval = sub.add_parser("digits-eval", help="Merge the digit detectors into 10-way classifiers")
-    digits_eval.add_argument("--checkpoints", type=Path, default=Path("digits"))
-    digits_eval.add_argument("--compiler", type=Path, help="defaults to the untrained geometric prior")
-    digits_eval.add_argument("--out", type=Path, default=Path("runs/digits_metrics.json"))
-    digits_eval.add_argument("--subsets", type=int, default=20, help="digit subsets sampled per merge size")
-    digits_eval.set_defaults(func=_cmd_digits_eval)
-
     widen = sub.add_parser("widen", help="Duplicate neurons to build a compress input")
     widen.add_argument("--ckpt", type=Path, required=True)
     widen.add_argument("--out", type=Path, required=True)
@@ -231,11 +183,6 @@ def main(argv: list[str] | None = None) -> None:
     compile_parser = sub.add_parser("compile", help="Apply a trained compiler to a checkpoint")
     compile_parser.add_argument("op", choices=("inject", "compress", "merge"))
     compile_parser.add_argument("--compiler", type=Path, default=Path("runs/compiler.pt"))
-    compile_parser.add_argument(
-        "--prior",
-        action="store_true",
-        help="merge with an untrained compiler sized to the checkpoints instead of loading --compiler",
-    )
     compile_parser.add_argument("--ckpt", type=Path)
     compile_parser.add_argument("--ckpt-a", type=Path)
     compile_parser.add_argument("--ckpt-b", type=Path, nargs="+", help="one or more checkpoints merged into --ckpt-a, in order")
