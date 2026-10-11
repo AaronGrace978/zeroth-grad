@@ -1,10 +1,9 @@
 """Layerwise Hungarian alignment of hidden units.
 
-With outgoing norms, the cost is interference: two units sharing a slot cost
-out_ref * out_src * (1 - cosine) on their incoming weights (row plus bias). A
-live unit next to a dead one costs nothing, so detectors spread into free
-slots before any two of them collide, and two copies of the same direction
-still share a slot for free. Magnitude-weighted cosine distance breaks ties.
+Cost is magnitude-weighted cosine distance on incoming weights (row plus bias),
+plus a small penalty for pairing two large orthogonal neurons. That keeps a
+trained detector matched to a spare rather than to an unrelated detector, and
+still matches two copies of the same direction exactly.
 """
 
 from __future__ import annotations
@@ -29,22 +28,14 @@ def match_cost(
     source: torch.Tensor,
     out_ref: torch.Tensor | None = None,
     out_src: torch.Tensor | None = None,
-    mode: str = "interference",
 ) -> torch.Tensor:
     """Cost[i, j] of pairing reference row i with source row j.
 
-    Without outgoing norms, this is magnitude-weighted cosine distance on the
-    incoming rows. With them, the main term is interference between two live
-    units, and the geometric term only breaks ties. A geometric cost alone
-    pairs a live unit with a partly similar live unit (cosine 0.3 is common in
-    64 dimensions) rather than with an empty slot, because an empty slot still
-    costs half the live unit's norm.
-
-    mode="legacy" is the earlier cost, geometric plus 5 * out_ref * out_src *
-    (1 - cosine), kept for ablations.
+    Incoming cosine is weighted by feature norm. Live neurons (large outgoing
+    norm) are additionally discouraged from pairing unless their incoming
+    directions actually match, so a skill detector lines up with a spare
+    instead of with an unrelated detector.
     """
-    if mode not in ("interference", "legacy"):
-        raise ValueError(f"unknown match cost mode {mode!r}")
     ref_n = _safe_normalize(reference)
     src_n = _safe_normalize(source)
     cosine = (ref_n @ src_n.T).clamp(-1, 1)
@@ -52,13 +43,11 @@ def match_cost(
     src_norm = source.norm(dim=1)
     magnitude = 0.5 * (ref_norm[:, None] + src_norm[None, :])
     orthogonal_large = 0.01 * (ref_norm[:, None] * src_norm[None, :]) * (1 - cosine)
-    geometric = (1 - cosine) * magnitude + orthogonal_large
-    if out_ref is None or out_src is None:
-        return geometric
-    interference = out_ref[:, None] * out_src[None, :] * (1 - cosine)
-    if mode == "legacy":
-        return geometric + 5 * interference
-    return interference + 1e-3 * geometric
+    cost = (1 - cosine) * magnitude + orthogonal_large
+    if out_ref is not None and out_src is not None:
+        mismatch = (1 - cosine).clamp(min=0)
+        cost = cost + 5 * out_ref[:, None] * out_src[None, :] * mismatch
+    return cost
 
 
 def permutation_from_cost(cost: torch.Tensor) -> torch.Tensor:
@@ -89,11 +78,7 @@ def permute_h2(weights: dict[str, torch.Tensor], perm: torch.Tensor) -> dict[str
     return out
 
 
-def align_to(
-    reference: dict[str, torch.Tensor],
-    source: dict[str, torch.Tensor],
-    mode: str = "interference",
-) -> dict[str, torch.Tensor]:
+def align_to(reference: dict[str, torch.Tensor], source: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Permute source hidden units so each lines up with reference."""
     if reference["w1"].shape != source["w1"].shape or reference["w2"].shape != source["w2"].shape:
         raise ValueError("alignment requires matching layer shapes")
@@ -102,7 +87,6 @@ def align_to(
         _features(source["w1"], source["b1"]),
         neuron_norm_h1(reference),
         neuron_norm_h1(source),
-        mode=mode,
     )
     aligned = permute_h1(source, permutation_from_cost(cost1))
     cost2 = match_cost(
@@ -110,6 +94,5 @@ def align_to(
         _features(aligned["w2"], aligned["b2"]),
         neuron_norm_h2(reference),
         neuron_norm_h2(aligned),
-        mode=mode,
     )
     return permute_h2(aligned, permutation_from_cost(cost2))
