@@ -6,6 +6,8 @@ The compiler itself is trained. Each step samples a checkpoint from a zoo of mod
 
 ![A checkpoint goes into the weight compiler, which compresses, injects, or merges it](docs/weight-compiler-diagram.jpg)
 
+The method, results, and limitations are written up in the [white paper](docs/whitepaper.md). What comes next is in the [roadmap](ROADMAP.md).
+
 ## Edit families
 
 Hidden units are a set. Permuting a layer permutes that layer's tokens and leaves the other layer's tokens in place, because messages between layers are products with the weight matrix (`W @ features`), not a flattened parameter vector.
