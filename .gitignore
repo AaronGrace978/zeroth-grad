@@ -9,3 +9,5 @@ build/
 checkpoints/
 runs/
 digits/
+digits_w32/
+digits_dense/

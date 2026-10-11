@@ -1,4 +1,4 @@
-"""Draw the held-out compiler results from runs/metrics.json, and the digits results if present."""
+"""Draw the held-out compiler results from runs/metrics.json, and the digits and extensions results if present."""
 
 import argparse
 import json
@@ -142,12 +142,113 @@ def _digits_figure(metrics: dict, out: Path) -> None:
     print(out)
 
 
+def _grouped(ax, title, groups: dict[str, dict[str, float]], colors: dict[str, str]) -> None:
+    names = list(groups)
+    series = list(colors)
+    width = 0.8 / len(series)
+    positions = np.arange(len(names))
+    for index, key in enumerate(series):
+        values = [groups[name].get(key, float("nan")) for name in names]
+        offset = (index - (len(series) - 1) / 2) * width
+        ax.bar(positions + offset, values, width=width * 0.92, color=colors[key], label=key, zorder=2)
+    ax.set_title(title, loc="left", fontsize=13, color=INK, pad=12, fontweight="medium")
+    ax.set_xticks(positions, names, fontsize=9, color=INK)
+    _style(ax)
+    ax.legend(frameon=False, fontsize=7.5, loc="lower left", labelcolor=INK, ncol=2)
+
+
+def _extensions_figure(metrics: dict, out: Path) -> None:
+    fig, axes = plt.subplots(1, 4, figsize=(19, 4.9), dpi=160, gridspec_kw={"width_ratios": [1, 1.1, 1.25, 1.1]})
+    fig.patch.set_facecolor(PAPER)
+
+    ax = axes[0]
+    scaling = metrics["alignment_scaling"]
+    widths = sorted(scaling, key=int)
+    xs = [int(w) for w in widths]
+    ax.loglog(xs, [scaling[w]["hungarian_s"] for w in widths], "-o", color=STONE, markersize=4, linewidth=1.8, label="Hungarian (exact)")
+    ax.loglog(xs, [scaling[w]["sinkhorn_s"] for w in widths], "-o", color=TEAL, markersize=4, linewidth=1.8, label="Sinkhorn + 2-opt")
+    ax.set_title("Alignment time by width", loc="left", fontsize=13, color=INK, pad=12, fontweight="medium")
+    ax.set_xlabel("Hidden width", color=MUTED)
+    ax.set_ylabel("Seconds (4 CPU cores)", color=MUTED)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.set_facecolor(PAPER)
+    ax.tick_params(colors=MUTED)
+    worst = max(scaling[w]["cost_ratio"] for w in widths)
+    ax.text(0.03, 0.93, f"Sinkhorn cost within {100 * (worst - 1):.2f}% of optimal", transform=ax.transAxes, fontsize=8, color=MUTED)
+    ax.legend(frameon=False, fontsize=8, loc="lower right", labelcolor=INK)
+
+    cap = metrics["capacity"]
+    groups = {}
+    for name, label in (("sparse_w32", "Sparse, width 32"), ("dense_w64", "Dense, width 64")):
+        if name in cap:
+            row = cap[name]
+            groups[label] = {
+                "Merge": row["merge_acc"],
+                "+ declared heads": row["declared_acc"],
+                "+ widening": row["expand_acc"],
+                "Fold, no widening": row.get("fold0.98_merge_acc", float("nan")),
+                "Ensemble": row["ensemble_acc"],
+            }
+    _grouped(
+        axes[1],
+        "Ten digits over capacity",
+        groups,
+        {"Merge": STONE, "+ declared heads": AMBER, "+ widening": TEAL, "Fold, no widening": "#5eead4", "Ensemble": INK},
+    )
+
+    inject = metrics["rank_k_inject"]
+    groups = {}
+    for task in ("halfspace", "slab", "wedge", "xor"):
+        row = inject.get(f"{task}_n2048")
+        if row:
+            groups[task] = {
+                "Before": row["before_new"],
+                "Rank-1 compiler": row["rank1_new"],
+                "Rank-k": row["rankk_new"],
+                "Adam, same examples": row.get("finetune_new", float("nan")),
+            }
+    _grouped(axes[2], "Inject a non-linear skill (2,048 examples)", groups, {"Before": STONE, "Rank-1 compiler": AMBER, "Rank-k": TEAL, "Adam, same examples": INK})
+
+    tf = metrics["transformer"]
+    groups = {}
+    for norm, label in (("layer", "LayerNorm"), ("rms", "RMSNorm")):
+        if norm in tf:
+            row = tf[norm]
+            groups[label] = {
+                "Average": row["average"]["mean"],
+                "Partner moved, naive": row["moved_average_unaligned"]["mean"],
+                "Partner moved, aligned": row["moved_average_aligned"]["mean"],
+                "Indep. init, aligned": row["independent"]["midpoint_aligned"],
+            }
+    _grouped(
+        axes[3],
+        "Merging two fine-tuned transformers",
+        groups,
+        {"Average": STONE, "Partner moved, naive": AMBER, "Partner moved, aligned": TEAL, "Indep. init, aligned": "#5eead4"},
+    )
+    fig.suptitle("Scaling extensions", x=0.02, ha="left", fontsize=16, color=INK, fontweight="medium")
+    fig.text(
+        0.02,
+        0.02,
+        "Teal is the new method. Accuracies are means over held-out checkpoints, detector seeds, or task pairs; see runs/extensions_metrics.json.",
+        color=MUTED,
+        fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.90))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, facecolor=fig.get_facecolor())
+    print(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics", type=Path, default=ROOT / "runs" / "metrics.json")
     parser.add_argument("--out", type=Path, default=ROOT / "docs" / "heldout_results.png")
     parser.add_argument("--digits-metrics", type=Path, default=ROOT / "runs" / "digits_metrics.json")
     parser.add_argument("--digits-out", type=Path, default=ROOT / "docs" / "digits_results.png")
+    parser.add_argument("--extensions-metrics", type=Path, default=ROOT / "runs" / "extensions_metrics.json")
+    parser.add_argument("--extensions-out", type=Path, default=ROOT / "docs" / "extensions_results.png")
     args = parser.parse_args()
     if not args.metrics.exists():
         raise SystemExit(f"{args.metrics} not found; run `python -m zeroth_grad eval` first")
@@ -157,6 +258,8 @@ def main() -> None:
     plt.rcParams["font.family"] = "DejaVu Sans"
     if args.digits_metrics.exists():
         _digits_figure(json.loads(args.digits_metrics.read_text()), args.digits_out)
+    if args.extensions_metrics.exists():
+        _extensions_figure(json.loads(args.extensions_metrics.read_text()), args.extensions_out)
     fig, axes = plt.subplots(1, 4, figsize=(16.5, 4.8), dpi=160)
     fig.patch.set_facecolor(PAPER)
     _panel(axes[0], "Inject an unseen skill", inject, {"Trained"})
