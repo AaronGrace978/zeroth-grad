@@ -10,10 +10,10 @@ still share a slot for free. Magnitude-weighted cosine distance breaks ties.
 from __future__ import annotations
 
 import torch
-from scipy.optimize import linear_sum_assignment
 
 from zeroth_grad.edit import neuron_norm_h1, neuron_norm_h2
 from zeroth_grad.mlp import clone_weights
+from zeroth_grad.solvers import solve_assignment
 
 
 def _features(weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -61,12 +61,9 @@ def match_cost(
     return interference + 1e-3 * geometric
 
 
-def permutation_from_cost(cost: torch.Tensor) -> torch.Tensor:
+def permutation_from_cost(cost: torch.Tensor, solver: str = "hungarian") -> torch.Tensor:
     """Return perm such that source[perm[i]] aligns with reference[i]."""
-    row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-    perm = torch.empty(cost.shape[0], dtype=torch.long)
-    perm[torch.as_tensor(row_ind, dtype=torch.long)] = torch.as_tensor(col_ind, dtype=torch.long)
-    return perm
+    return solve_assignment(cost, solver)
 
 
 def permute_h1(weights: dict[str, torch.Tensor], perm: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -93,8 +90,14 @@ def align_to(
     reference: dict[str, torch.Tensor],
     source: dict[str, torch.Tensor],
     mode: str = "interference",
+    solver: str = "hungarian",
 ) -> dict[str, torch.Tensor]:
-    """Permute source hidden units so each lines up with reference."""
+    """Permute source hidden units so each lines up with reference.
+
+    `solver` is "hungarian" (exact, O(N^3)), "sinkhorn" (entropic transport
+    rounded to a permutation, O(N^2) per iteration), or "auto" (Sinkhorn above
+    width 2048).
+    """
     if reference["w1"].shape != source["w1"].shape or reference["w2"].shape != source["w2"].shape:
         raise ValueError("alignment requires matching layer shapes")
     cost1 = match_cost(
@@ -104,7 +107,7 @@ def align_to(
         neuron_norm_h1(source),
         mode=mode,
     )
-    aligned = permute_h1(source, permutation_from_cost(cost1))
+    aligned = permute_h1(source, permutation_from_cost(cost1, solver))
     cost2 = match_cost(
         _features(reference["w2"], reference["b2"]),
         _features(aligned["w2"], aligned["b2"]),
@@ -112,4 +115,32 @@ def align_to(
         neuron_norm_h2(aligned),
         mode=mode,
     )
-    return permute_h2(aligned, permutation_from_cost(cost2))
+    return permute_h2(aligned, permutation_from_cost(cost2, solver))
+
+
+def slot_collisions(
+    reference: dict[str, torch.Tensor],
+    aligned: dict[str, torch.Tensor],
+    share_cosine: float = 0.999,
+    eps: float = 1e-6,
+) -> tuple[int, int]:
+    """Aligned slots where both parents have a live unit that is not a positive copy of the other.
+
+    Two live units in one slot interfere unless their incoming rows (with
+    bias) are positively parallel, in which case one ReLU computes both up to
+    scale and the slot can be shared exactly.
+    """
+    counts = []
+    for feats, norm in ((_features_h1, neuron_norm_h1), (_features_h2, neuron_norm_h2)):
+        both = (norm(reference) > eps) & (norm(aligned) > eps)
+        cosine = (_safe_normalize(feats(reference)) * _safe_normalize(feats(aligned))).sum(dim=1)
+        counts.append(int((both & (cosine < share_cosine)).sum()))
+    return counts[0], counts[1]
+
+
+def _features_h1(weights: dict[str, torch.Tensor]) -> torch.Tensor:
+    return _features(weights["w1"], weights["b1"])
+
+
+def _features_h2(weights: dict[str, torch.Tensor]) -> torch.Tensor:
+    return _features(weights["w2"], weights["b2"])
