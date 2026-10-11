@@ -284,6 +284,8 @@ def mix_checkpoints(
     lam1: torch.Tensor,
     lam2: torch.Tensor,
     lam3: torch.Tensor | None = None,
+    shared1: torch.Tensor | None = None,
+    shared2: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Mix two aligned checkpoints. lam is the weight on `a`.
 
@@ -291,17 +293,30 @@ def mix_checkpoints(
     the readout: head k reads a hidden unit only when both come from the same
     parent. Without it, every head reads every unit and b3 follows the
     readout-norm ratio.
+
+    shared1 / shared2 mark slots where both parents hold the same unit (see
+    `capacity.share_slots`). A shared slot belongs to both parents, so each
+    parent's downstream units read it at full strength.
     """
     lam1 = lam1.view(-1)
     lam2 = lam2.view(-1)
+    s1 = torch.zeros_like(lam1) if shared1 is None else shared1.view(-1).to(lam1)
+    s2 = torch.zeros_like(lam2) if shared2 is None else shared2.view(-1).to(lam2)
     w1 = lam1[:, None] * a["w1"] + (1 - lam1)[:, None] * b["w1"]
     b1 = lam1 * a["b1"] + (1 - lam1) * b["b1"]
     # A connection is kept only when both of its endpoints come from the same parent.
     # Cross-parent entries are dropped so the two circuits do not bleed into each other.
-    use_a = lam2[:, None] * lam1[None, :]
-    use_b = (1 - lam2)[:, None] * (1 - lam1)[None, :]
+    from_a1 = lam1 + s1 * (1 - lam1)
+    from_b1 = (1 - lam1) + s1 * lam1
+    use_a = lam2[:, None] * from_a1[None, :]
+    use_b = (1 - lam2)[:, None] * from_b1[None, :]
+    # A shared hidden-2 row is the same row in both parents, so it is kept whole.
+    use_a = use_a + s2[:, None] * (1 - lam2)[:, None] * from_a1[None, :]
+    use_b = use_b * (1 - s2)[:, None]
     w2 = use_a * a["w2"] + use_b * b["w2"]
     b2 = lam2 * a["b2"] + (1 - lam2) * b["b2"]
+    from_a2 = lam2 + s2 * (1 - lam2)
+    from_b2 = (1 - lam2) + s2 * lam2
     if lam3 is None:
         w3 = lam2[None, :] * a["w3"] + (1 - lam2)[None, :] * b["w3"]
         head_a = head_norm(a)
@@ -309,8 +324,8 @@ def mix_checkpoints(
         lam_head = head_a / (head_a + head_b + 1e-8)
     else:
         lam_head = lam3.view(-1)
-        read_a = lam_head[:, None] * lam2[None, :]
-        read_b = (1 - lam_head)[:, None] * (1 - lam2)[None, :]
+        read_a = lam_head[:, None] * from_a2[None, :]
+        read_b = (1 - lam_head)[:, None] * from_b2[None, :]
         w3 = read_a * a["w3"] + read_b * b["w3"]
     b3 = lam_head * a["b3"] + (1 - lam_head) * b["b3"]
     return {"w1": w1, "b1": b1, "w2": w2, "b2": b2, "w3": w3, "b3": b3}

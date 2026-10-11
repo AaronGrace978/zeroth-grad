@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from zeroth_grad.align import align_to
+from zeroth_grad.capacity import fit_for_merge, share_slots
 from zeroth_grad.edit import (
     apply_compress,
     apply_rank1_inject,
@@ -244,9 +245,15 @@ class WeightCompiler(nn.Module):
         weights_a: dict[str, torch.Tensor],
         weights_b: dict[str, torch.Tensor],
         align_mode: str = "interference",
+        solver: str = "hungarian",
+        aligned: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """Return (lam1, lam2, lam3, aligned_b). Each lam is the weight on `a`; lam3 is per output head."""
-        aligned = align_to(weights_a, weights_b, mode=align_mode)
+        """Return (lam1, lam2, lam3, aligned_b). Each lam is the weight on `a`; lam3 is per output head.
+
+        Pass `aligned` to skip alignment when `weights_b` has already been aligned to `weights_a`.
+        """
+        if aligned is None:
+            aligned = align_to(weights_a, weights_b, mode=align_mode, solver=solver)
         pair1, pair2, pair3 = self.merge_features(weights_a, aligned)
         prior1 = norm_prior(neuron_norm_h1(weights_a), neuron_norm_h1(aligned)).detach()
         prior2 = norm_prior(neuron_norm_h2(weights_a), neuron_norm_h2(aligned)).detach()
@@ -264,24 +271,107 @@ class WeightCompiler(nn.Module):
         weights_a: dict[str, torch.Tensor],
         weights_b: dict[str, torch.Tensor],
         align_mode: str = "interference",
-    ) -> dict[str, torch.Tensor]:
+        solver: str = "hungarian",
+        expand: bool = False,
+        share: bool = True,
+        heads_a: list[int] | None = None,
+        heads_b: list[int] | None = None,
+        return_info: bool = False,
+    ):
+        """Merge two checkpoints into one network.
+
+        Parents of different widths are padded with dead units to a common
+        width. With `expand=True`, slots in which two live units would collide
+        are resolved by widening both parents until the alignment is
+        collision-free, so the merge stays exact (white paper, Section 4.5).
+        With `share=True`, positively parallel units in one slot are kept once
+        and read by both parents at full strength. `heads_a` / `heads_b`
+        declare which output heads each parent was trained on; a declared head
+        gets hard ownership instead of the readout-norm gate.
+        """
         a = clone_weights(weights_a)
         b = clone_weights(weights_b)
-        lam1, lam2, lam3, aligned = self.merge_lambdas(a, b, align_mode=align_mode)
-        return mix_checkpoints(a, aligned, lam1, lam2, lam3)
+        fit = fit_for_merge(a, b, mode=align_mode, solver=solver, expand=expand)
+        a, aligned = fit.reference, fit.aligned
+        shared1 = shared2 = None
+        if share:
+            aligned, shared1, shared2 = share_slots(a, aligned)
+        lam1, lam2, lam3, aligned = self.merge_lambdas(a, aligned, aligned=aligned)
+        lam3 = declared_ownership(lam3, heads_a, heads_b)
+        merged = mix_checkpoints(a, aligned, lam1, lam2, lam3, shared1, shared2)
+        if not return_info:
+            return merged
+        info = {
+            "width_h1": int(merged["w1"].shape[0]),
+            "width_h2": int(merged["w2"].shape[0]),
+            "added_h1": fit.added_h1,
+            "added_h2": fit.added_h2,
+            "collisions_h1": fit.collisions_h1,
+            "collisions_h2": fit.collisions_h2,
+            "shared_h1": int(shared1.sum()) if shared1 is not None else 0,
+            "shared_h2": int(shared2.sum()) if shared2 is not None else 0,
+        }
+        return merged, info
 
     def merge_many(
         self,
         checkpoints: list[dict[str, torch.Tensor]],
         align_mode: str = "interference",
-    ) -> dict[str, torch.Tensor]:
-        """Fold merge left to right: merge(merge(merge(c0, c1), c2), ...)."""
+        solver: str = "hungarian",
+        expand: bool = False,
+        share: bool = True,
+        heads: list[list[int]] | None = None,
+        return_info: bool = False,
+    ):
+        """Fold merge left to right: merge(merge(merge(c0, c1), c2), ...).
+
+        `heads[m]` lists the output heads checkpoint m was trained on. The
+        running merge owns the union of the heads folded into it so far.
+        """
         if not checkpoints:
             raise ValueError("merge_many needs at least one checkpoint")
+        if heads is not None and len(heads) != len(checkpoints):
+            raise ValueError("heads needs one list per checkpoint")
         merged = clone_weights(checkpoints[0])
-        for other in checkpoints[1:]:
-            merged = self.merge(merged, other, align_mode=align_mode)
-        return merged
+        owned = list(heads[0]) if heads is not None else None
+        infos = []
+        for index, other in enumerate(checkpoints[1:], start=1):
+            merged, info = self.merge(
+                merged,
+                other,
+                align_mode=align_mode,
+                solver=solver,
+                expand=expand,
+                share=share,
+                heads_a=owned,
+                heads_b=heads[index] if heads is not None else None,
+                return_info=True,
+            )
+            if owned is not None:
+                owned = sorted(set(owned) | set(heads[index]))
+            infos.append(info)
+        if not return_info:
+            return merged
+        return merged, infos
+
+
+def declared_ownership(
+    lam3: torch.Tensor,
+    heads_a: list[int] | None,
+    heads_b: list[int] | None,
+) -> torch.Tensor:
+    """Hard ownership for heads only one parent declares. Heads both or neither declare keep the gate."""
+    if not heads_a and not heads_b:
+        return lam3
+    set_a = set(heads_a or [])
+    set_b = set(heads_b or [])
+    target = lam3.detach().clone()
+    for head in set_a - set_b:
+        target[head] = 1.0
+    for head in set_b - set_a:
+        target[head] = 0.0
+    # Straight-through, so a training loss still reaches the residual head.
+    return target + lam3 - lam3.detach()
 
 
 def _encoder_layer(d_model: int, nhead: int) -> nn.TransformerEncoderLayer:
