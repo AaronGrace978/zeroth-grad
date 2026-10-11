@@ -1,10 +1,13 @@
-"""Layerwise Hungarian alignment of hidden units.
+"""Layerwise alignment of hidden units.
 
 With outgoing norms, the cost is interference: two units sharing a slot cost
 out_ref * out_src * (1 - cosine) on their incoming weights (row plus bias). A
 live unit next to a dead one costs nothing, so detectors spread into free
 slots before any two of them collide, and two copies of the same direction
 still share a slot for free. Magnitude-weighted cosine distance breaks ties.
+
+The assignment is solved exactly by the Hungarian method, or approximately by
+Sinkhorn transport for wide layers (see `solvers.py`).
 """
 
 from __future__ import annotations

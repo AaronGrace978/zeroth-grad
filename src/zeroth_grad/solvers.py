@@ -26,6 +26,16 @@ def hungarian(cost: torch.Tensor) -> torch.Tensor:
     return perm
 
 
+def _gibbs(f: torch.Tensor, g: torch.Tensor, c: torch.Tensor, eps: float) -> torch.Tensor:
+    """exp((f + g - C) / eps), with the exponent floored so no entry is a subnormal float.
+
+    Subnormals make CPU matrix products many times slower. The floor, e^-87,
+    is the smallest normal float32 and is negligible against the plan's mass.
+    """
+    z = (f[:, None] + g[None, :] - c) / eps
+    return torch.exp(z.clamp_min_(-87.0))
+
+
 def sinkhorn_potentials(
     cost: torch.Tensor,
     eps_start: float = 1.0,
@@ -33,6 +43,7 @@ def sinkhorn_potentials(
     stages: int = 16,
     iters: int = 30,
     keep: int = 1,
+    tol: float = 1e-2,
 ) -> list[tuple[torch.Tensor, torch.Tensor, float]]:
     """Dual potentials (f, g) of entropic OT with uniform marginals, by epsilon scaling.
 
@@ -40,7 +51,8 @@ def sinkhorn_potentials(
     builds the Gibbs kernel exp((f + g - C) / eps) once and runs plain
     multiplicative Sinkhorn updates on it, then folds the scalings back into
     the potentials. Folding keeps the kernel near 1 where the plan has mass,
-    so float32 does not overflow as eps shrinks. Returns (f, g, eps) for the
+    so float32 does not overflow as eps shrinks. A stage stops early once
+    every row sum is within `tol` of 1. Returns (f, g, eps) for the
     last `keep` stages, coarsest first.
     """
     c = cost.detach().to(dtype=torch.float32)
@@ -56,11 +68,16 @@ def sinkhorn_potentials(
     tiny = torch.finfo(c.dtype).tiny
     history: list[tuple[torch.Tensor, torch.Tensor, float]] = []
     for _ in range(stages):
-        kernel = torch.exp((f[:, None] + g[None, :] - c) / eps)
+        kernel = _gibbs(f, g, c, eps)
         u = torch.ones(n, dtype=c.dtype, device=c.device)
         v = torch.ones(m, dtype=c.dtype, device=c.device)
-        for _ in range(iters):
-            u = 1.0 / (kernel @ v).clamp_min(tiny)
+        for step in range(iters):
+            row = (kernel @ v).clamp_min(tiny)
+            # After a column update the columns are exact, so the row sums
+            # measure how far the plan is from both marginals.
+            if step > 0 and float((u * row - 1).abs().max()) < tol:
+                break
+            u = 1.0 / row
             v = 1.0 / (kernel.T @ u).clamp_min(tiny)
         f = f + eps * torch.log(u)
         g = g + eps * torch.log(v)
@@ -82,8 +99,9 @@ def _plans(cost: torch.Tensor, **kwargs):
     scale = float(c.abs().mean())
     if not math.isfinite(scale) or scale <= 0:
         scale = 1.0
+    c = c / scale
     for f, g, eps in sinkhorn_potentials(cost, **kwargs):
-        yield torch.exp((f[:, None] + g[None, :] - c / scale) / eps)
+        yield _gibbs(f, g, c, eps)
 
 
 def sinkhorn_plan(cost: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -146,32 +164,45 @@ def sinkhorn(
     return two_opt(cost, best)
 
 
-def two_opt(cost: torch.Tensor, perm: torch.Tensor, passes: int = 20, batch: int = 256) -> torch.Tensor:
-    """Improve an assignment by pairwise swaps. Each pass is O(N^2) and applies disjoint improving swaps.
+def two_opt(cost: torch.Tensor, perm: torch.Tensor, passes: int = 20, batch: int = 256, chunk: int = 1024) -> torch.Tensor:
+    """Improve an assignment by pairwise swaps, applying disjoint improving swaps each pass.
 
     Swapping the columns of rows i and j changes the cost by
-    C[i, p_j] + C[j, p_i] - C[i, p_i] - C[j, p_j]; every pair is scored at once.
+    C[i, p_j] + C[j, p_i] - C[i, p_i] - C[j, p_j]. If both rows already hold
+    their row minimum, neither term can fall, so only rows above their
+    minimum are scored, against every partner. A pass is O(S N) for S such
+    rows, and at most O(N^2).
     """
     c = cost.detach().to(dtype=torch.float32)
+    n = c.shape[0]
     perm = perm.clone().to(c.device)
     tol = 1e-7 * float(c.abs().mean())
+    row_min = c.min(dim=1).values
     for _ in range(passes):
-        taken = c[:, perm]
-        diag = taken.diagonal()
-        gain = taken + taken.T - diag[:, None] - diag[None, :]
-        gain = torch.triu(gain, diagonal=1)
-        k = min(batch, gain.numel())
-        values, flat = torch.topk(-gain.flatten(), k)
-        improving = values > tol
+        held = c[torch.arange(n, device=c.device), perm]
+        suspects = (held > row_min + tol).nonzero().flatten()
+        if suspects.numel() == 0:
+            break
+        best_vals, best_i, best_j = [], [], []
+        for lo in range(0, suspects.numel(), chunk):
+            rows = suspects[lo : lo + chunk]
+            # gain[r, j] for suspect row r = rows[r] and partner j.
+            gain = c[rows][:, perm] + c[:, perm[rows]].T - held[rows][:, None] - held[None, :]
+            gain[torch.arange(rows.numel(), device=c.device), rows] = 0
+            k = min(batch, gain.numel())
+            values, flat = torch.topk(-gain.flatten(), k)
+            best_vals.append(values)
+            best_i.append(rows[flat // n])
+            best_j.append(flat % n)
+        values = torch.cat(best_vals)
+        order = torch.argsort(values, descending=True)
+        improving = values[order] > tol
         if not bool(improving.any()):
             break
-        n = c.shape[0]
         used = set()
-        rows_i = (flat[improving] // n).tolist()
-        rows_j = (flat[improving] % n).tolist()
         swaps = []
-        for i, j in zip(rows_i, rows_j):
-            if i in used or j in used:
+        for i, j in zip(torch.cat(best_i)[order][improving].tolist(), torch.cat(best_j)[order][improving].tolist()):
+            if i in used or j in used or i == j:
                 continue
             used.update((i, j))
             swaps.append((i, j))
