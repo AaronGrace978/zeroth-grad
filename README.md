@@ -192,14 +192,14 @@ The slab and XOR are invisible to a rank-1 write: their class means coincide. Th
 
 `transformer_align.py` aligns one transformer to another by coordinate descent over these groups, in the style of Git Re-Basin weight matching. Each round matches the residual stream (assignment on read/write features, or Procrustes when rotations are allowed), fits a least-squares scale, matches heads by their QK and OV circuits, aligns each head's internals by Procrustes, and matches MLP units. `merge_transformers` then averages, or adds task vectors onto a shared base.
 
-Benchmark (`transformer_bench.py`): a base model is trained on two token tasks, "copy the previous digit" and "running maximum". Two fine-tunes each specialize on one task. The second fine-tune is then moved by a random exact symmetry: residual permutation, head permutation, Q/K and V/O rotations, MLP permutation, and under RMSNorm a residual rotation with a scale of 1.7. Mean accuracy over both tasks:
+Benchmark (`transformer_bench.py`): a base model is trained on two token tasks, "copy the previous digit" and "running maximum". Two fine-tunes each specialize on one task. The second fine-tune is then moved by a random exact symmetry. Under LayerNorm that is a permutation of the residual stream, the heads, each head's Q/K and V/O bases, and the MLP units. Under RMSNorm it is a random rotation of the residual stream, a scale of 1.7 on every write, random Q/K and V/O rotations in every head, and the head and MLP permutations. Mean accuracy over both tasks:
 
 | norm | fine-tunes alone | average | task arithmetic | moved partner, average, unaligned | moved partner, average, aligned | partner distance before → after |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | LayerNorm | 0.974 / 0.793 | 0.991 | 0.896 | 0.162 | 0.991 | 1.31 → 0.000 |
 | RMSNorm | 0.989 / 0.870 | 0.998 | 0.952 | 0.334 | 0.998 | 1.69 → 0.000 |
 
-Alignment recovers the hidden symmetry exactly, so the merge of a moved partner equals the merge of the unmoved one. Between two models trained from independent initializations, the midpoint is still poor (endpoints 1.0; midpoint 0.21 unaligned, 0.34 aligned under LayerNorm; 0.21, 0.42 with permutations only, and 0.64 with rotations under RMSNorm). Alignment removes symmetry, not the loss barrier between independently trained basins. The transformer path is geometric only: the learned compiler does not process transformer weights.
+Alignment recovers the hidden symmetry exactly, so the merge of a moved partner equals the merge of the unmoved one. Between two models trained from independent initializations, the midpoint is still poor (endpoints 1.0; midpoint 0.21 unaligned and 0.34 aligned under LayerNorm; under RMSNorm 0.21 unaligned, 0.42 aligned with permutations only, and 0.64 aligned with rotations). Alignment removes symmetry, not the loss barrier between independently trained basins. The transformer path is geometric only: the learned compiler does not process transformer weights.
 
 ## Commands
 
