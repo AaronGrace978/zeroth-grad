@@ -71,17 +71,17 @@ Held-out checkpoints, CPU, after `populate --steps 300` and `train --steps 400`.
 | untrained compiler (alignment, norm gates, head ownership) | 0.984 |
 | norm-gate stitch without head ownership | 0.874 |
 | uniform average, no alignment | 0.846 |
-| uniform average after alignment | 0.886 |
+| uniform average after alignment | 0.887 |
 | compiler, partner hidden units permuted | 0.984 |
 | uniform average, partner hidden units permuted | 0.861 |
 
-The merge is lossless up to the ceiling, and permutation does not move it. Without head ownership the same stitch scores 0.874: alignment already places the two parents' live units in different slots (one collision in 30 pairs), and the remaining loss is readout crosstalk.
+The merge is lossless up to the ceiling, and permutation does not move it. Without head ownership the same stitch scores 0.874: alignment places the two parents' live units in different slots in all 30 pairs, and the remaining loss is readout crosstalk.
 
 **Merge k checkpoints** (every k-subset of distinct held-out skills sharing a seed, folded into one 32-wide network, mean accuracy on the k skills):
 
 | k | subsets | compiler | untrained compiler | aligned uniform soup | ceiling |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 30 | 0.984 | 0.984 | 0.886 | 0.985 |
+| 2 | 30 | 0.984 | 0.984 | 0.887 | 0.985 |
 | 3 | 40 | 0.984 | 0.983 | 0.660 | 0.985 |
 | 4 | 30 | 0.984 | 0.982 | 0.591 | 0.985 |
 | 5 | 12 | 0.984 | 0.979 | 0.565 | 0.985 |
