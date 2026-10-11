@@ -1,4 +1,4 @@
-"""Draw the held-out compiler results from runs/metrics.json."""
+"""Draw the held-out compiler results from runs/metrics.json, and the digits results if present."""
 
 import argparse
 import json
@@ -98,10 +98,56 @@ def _curve_panel(ax, merge_many: dict) -> None:
     ax.legend(frameon=False, fontsize=8, loc="lower left", labelcolor=INK)
 
 
+def _digits_figure(metrics: dict, out: Path) -> None:
+    ten = metrics["ten_way"]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), dpi=160, gridspec_kw={"width_ratios": [1, 1.25]})
+    fig.patch.set_facecolor(PAPER)
+    bars = {
+        "Merged (compiler)": ten["compiler_acc"],
+        "Ensemble of 10": ten["ensemble_acc"],
+        "Joint training": ten["joint_acc"],
+        "Legacy alignment": ten["legacy_alignment_acc"],
+        "Aligned soup": ten["aligned_soup_acc"],
+    }
+    _panel(axes[0], "Ten detectors, one classifier", bars, {"Merged (compiler)", "Ensemble of 10", "Joint training"})
+    merge_k = metrics["merge_k"]
+    sizes = sorted(merge_k, key=int)
+    ks = [int(k) for k in sizes]
+    lines = (
+        ("Merged (compiler)", "compiler_acc", TEAL, "-"),
+        ("Ensemble of separate detectors", "ensemble_acc", STONE, "--"),
+        ("Legacy alignment", "legacy_alignment_acc", MUTED, ":"),
+        ("Aligned soup", "aligned_soup_acc", AMBER, "-"),
+    )
+    ax = axes[1]
+    for label, key, color, style in lines:
+        ax.plot(ks, [merge_k[k][key] for k in sizes], style, color=color, marker="o", markersize=4, linewidth=1.8, label=label, zorder=2)
+    ax.set_title("Merge k digit detectors", loc="left", fontsize=13, color=INK, pad=12, fontweight="medium")
+    ax.set_xticks(ks, [str(k) for k in ks], fontsize=9, color=INK)
+    ax.set_xlabel("Digits merged (k-way test accuracy)", color=MUTED)
+    _style(ax)
+    ax.legend(frameon=False, fontsize=8, loc="lower left", labelcolor=INK)
+    fig.suptitle(
+        f"8x8 digits, width {metrics['width']}, mean of {metrics['seeds']} detector seeds",
+        x=0.02,
+        ha="left",
+        fontsize=16,
+        color=INK,
+        fontweight="medium",
+    )
+    fig.text(0.02, 0.02, "No checkpoint is trained during the merge. Joint training is a reference network trained on all ten labels.", color=MUTED, fontsize=9)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.90))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, facecolor=fig.get_facecolor())
+    print(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics", type=Path, default=ROOT / "runs" / "metrics.json")
     parser.add_argument("--out", type=Path, default=ROOT / "docs" / "heldout_results.png")
+    parser.add_argument("--digits-metrics", type=Path, default=ROOT / "runs" / "digits_metrics.json")
+    parser.add_argument("--digits-out", type=Path, default=ROOT / "docs" / "digits_results.png")
     args = parser.parse_args()
     if not args.metrics.exists():
         raise SystemExit(f"{args.metrics} not found; run `python -m zeroth_grad eval` first")
@@ -109,6 +155,8 @@ def main() -> None:
     inject, compress, merge = _series(metrics)
 
     plt.rcParams["font.family"] = "DejaVu Sans"
+    if args.digits_metrics.exists():
+        _digits_figure(json.loads(args.digits_metrics.read_text()), args.digits_out)
     fig, axes = plt.subplots(1, 4, figsize=(16.5, 4.8), dpi=160)
     fig.patch.set_facecolor(PAPER)
     _panel(axes[0], "Inject an unseen skill", inject, {"Trained"})

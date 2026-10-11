@@ -20,7 +20,7 @@ with scales `a`, `s`, `c`, `r` predicted by the compiler. Old heads are left alo
 
 **Compress.** Exact duplicate neurons (incoming cosine at least 0.999) are one cluster. The compiler keeps one neuron per cluster, up to the pre-duplication width, and adds the dropped copies' outgoing weights onto the survivor. A learned residual breaks ties; on exact copies the collapse is geometric. Magnitude pruning keeps the largest fragments and drops the rest, which is the baseline this edit beats.
 
-**Merge.** Hidden units of checkpoint B are matched to A with the Hungarian algorithm. The cost is magnitude-weighted cosine distance on incoming weights (row plus bias), plus a penalty for pairing two live neurons whose incoming directions disagree. Per-neuron gates mix the endpoints, and a connection is kept only when both endpoints come from the same parent. A random hidden permutation of B is undone by the match, so the merged function does not depend on that permutation.
+**Merge.** Hidden units of checkpoint B are matched to A with the Hungarian algorithm. The cost of putting two units in one slot is their interference, `|out_A| · |out_B| · (1 − cos)` on incoming weights (row plus bias), with magnitude-weighted cosine distance as a tie breaker. A live unit next to a dead one costs nothing, so detectors spread into free slots before any two collide, and two copies of one direction still share a slot. Per-neuron gates mix the endpoints, and a connection is kept only when both endpoints come from the same parent. A random hidden permutation of B is undone by the match, so the merged function does not depend on that permutation.
 
 Output heads have a parent too. Each head gets an ownership gate
 
@@ -85,9 +85,39 @@ The merge is lossless up to the ceiling, and permutation does not move it. Witho
 | 3 | 40 | 0.984 | 0.983 | 0.660 | 0.985 |
 | 4 | 30 | 0.984 | 0.982 | 0.591 | 0.985 |
 | 5 | 12 | 0.984 | 0.979 | 0.565 | 0.985 |
-| 6 | 2 | 0.980 | 0.971 | 0.549 | 0.985 |
+| 6 | 2 | 0.977 | 0.968 | 0.549 | 0.985 |
 
-Six single-skill checkpoints fit in one network at the original width. The trained ownership temperature (4.0 to 5.2 over training) is what separates the compiler from its initialization as k grows. Compiler training seeds 0, 1, and 2 give 0.984 on pairs and 0.979–0.980 at k = 6.
+Six single-skill checkpoints fit in one network at the original width. The trained ownership temperature (4.0 to 5.2 over training) is what separates the compiler from its initialization as k grows. Compiler training seeds 0, 1, and 2 give 0.984 on pairs and 0.977–0.978 at k = 6.
+
+## Real data: ten digit detectors, one classifier
+
+The halfspace zoo is synthetic, so `digits-populate` builds a second zoo on scikit-learn's 8×8 handwritten digits (1,797 images, 64 pixels; 1,200 train, 597 test). Each checkpoint is a `64 → 64 → 64 → 10` MLP trained from a shared initialization to detect one digit on its own logit, with balanced one-vs-rest BCE and a group-sparsity penalty on outgoing weights, then carved like the halfspace zoo. `digits-eval` merges the ten detectors of a seed into one network and reads it as a 10-way classifier (argmax over heads). Nothing is trained during the merge, and the compiler is the untrained geometric prior (alignment, norm gates, head ownership), because the halfspace compiler is sized for 16 inputs.
+
+![Ten merged digit detectors match their ensemble and a jointly trained network](docs/digits_results.png)
+
+Mean over 3 detector seeds, 10-way test accuracy:
+
+| | accuracy |
+| --- | ---: |
+| ten detectors merged into one 64-wide network | 0.971 |
+| ensemble of the ten separate detectors (ceiling) | 0.971 |
+| one 64-wide network trained on all ten labels | 0.972 |
+| merge with the legacy alignment cost | 0.401 |
+| aligned uniform soup | 0.112 |
+
+The merge equals the ensemble at every k from 2 to 10 digits, and it is about 0.001 below a network trained on all ten labels at once. The legacy alignment cost charged a live unit half its norm for sitting next to an empty slot, so it stacked live units whose incoming cosine was above about 0.2. In 64 dimensions that is common, and the ten detectors collapsed into a handful of slots.
+
+The limit is capacity: the merge is lossless when the detectors' live units fit in the width.
+
+| width | live hidden-1 units, all ten detectors | merged | ensemble |
+| ---: | ---: | ---: | ---: |
+| 32 | 48 | 0.891 | 0.972 |
+| 48 | 43 | 0.970 | 0.971 |
+| 64 | 45 | 0.971 | 0.971 |
+| 128 | 45 | 0.972 | 0.972 |
+| 64, no sparsity penalty | 123 | 0.633 | 0.967 |
+
+The sparsity penalty is what makes the detectors mergeable: it cuts the units they need from about 123 to about 45, and the ensemble of sparse detectors is no worse (0.971 against 0.967 without the penalty). Without it, the two alignment costs are close (0.633 interference, 0.651 legacy), since collisions are forced either way.
 
 ## Commands
 
@@ -111,12 +141,17 @@ python -m zeroth_grad compile merge \
 python -m zeroth_grad compile merge --ckpts checkpoints/heldout_single_s{0,1,2,3}_seed5.safetensors \
     --out /tmp/merged4.safetensors
 
+python -m zeroth_grad digits-populate --out digits
+python -m zeroth_grad digits-eval --checkpoints digits
+python -m zeroth_grad compile merge --prior --ckpts digits/digit{0,1,2,3,4,5,6,7,8,9}_seed0.safetensors \
+    --out /tmp/ten_way.safetensors
+
 python scripts/plot_results.py
 ```
 
-`compile merge` folds `--ckpts` (or `--ckpt-a` followed by one or more `--ckpt-b`) left to right, and the output's `skills` metadata is the union of its parents'. `compile inject` also accepts `--examples batch.pt` (`{"x", "y"}`) or `--phi direction.pt`. `compile` runs under `torch.no_grad()` and does not require gradients on the loaded tensors.
+`compile merge` folds `--ckpts` (or `--ckpt-a` followed by one or more `--ckpt-b`) left to right, and the output's `skills` metadata is the union of its parents'. `--prior` merges with an untrained compiler sized to the checkpoints, for shapes the trained compiler was not built for. `compile inject` also accepts `--examples batch.pt` (`{"x", "y"}`) or `--phi direction.pt`. `compile` runs under `torch.no_grad()` and does not require gradients on the loaded tensors.
 
-`checkpoints/` and `runs/` are local artifacts. Tests run with `pip install -e ".[dev]"` and `pytest`; the figure needs `matplotlib` (`pip install -e ".[plot]"`).
+`checkpoints/`, `digits/`, and `runs/` are local artifacts. Tests run with `pip install -e ".[dev]"` and `pytest`. The digits benchmark needs scikit-learn (`pip install -e ".[digits]"`; its test is skipped without it), and the figures need matplotlib (`pip install -e ".[plot]"`).
 
 ## Neighbors
 
@@ -124,4 +159,4 @@ Git Re-Basin aligns hidden units before averaging. Task arithmetic edits a check
 
 ## Layout
 
-`src/zeroth_grad/` holds the MLP and functional forward (`mlp.py`), synthetic skills (`data.py`), checkpoint I/O (`io.py`), Hungarian alignment (`align.py`), the edit algebra (`edit.py`), the equivariant compiler (`compiler.py`), the zoo (`zoo.py`), functional training (`train.py`), held-out eval including the k-way merge curve (`evaluate.py`), and the CLI (`cli.py`).
+`src/zeroth_grad/` holds the MLP and functional forward (`mlp.py`), synthetic skills (`data.py`), checkpoint I/O (`io.py`), Hungarian alignment (`align.py`), the edit algebra (`edit.py`), the equivariant compiler (`compiler.py`), the zoo (`zoo.py`), functional training (`train.py`), held-out eval including the k-way merge curve (`evaluate.py`), the digits benchmark (`digits.py`), and the CLI (`cli.py`).
