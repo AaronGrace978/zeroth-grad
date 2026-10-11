@@ -92,6 +92,30 @@ def _cmd_digits_eval(args: argparse.Namespace) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def _cmd_extensions(args: argparse.Namespace) -> None:
+    from zeroth_grad.extensions import run_extensions
+
+    run_extensions(
+        checkpoints=args.checkpoints,
+        compiler=args.compiler,
+        digits=args.digits,
+        digits_w32=args.digits_w32,
+        digits_dense=args.digits_dense,
+        widths=tuple(args.widths),
+        out=args.out,
+        sections=tuple(args.sections),
+    )
+    print(f"wrote {args.out}")
+
+
+def _load_examples(path: Path) -> tuple[torch.Tensor, torch.Tensor | None]:
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(blob, torch.Tensor):
+        return blob.float(), None
+    y = blob.get("y")
+    return blob["x"].float(), (y.float() if y is not None else None)
+
+
 def _cmd_widen(args: argparse.Namespace) -> None:
     weights, meta = load_checkpoint(args.ckpt)
     base_h1 = meta.get("base_h1", str(weights["w1"].shape[0]))
@@ -132,10 +156,50 @@ def _prior_compiler(args: argparse.Namespace) -> WeightCompiler:
 
 
 def _compile(args: argparse.Namespace) -> None:
-    compiler = _prior_compiler(args) if args.prior else load_compiler(args.compiler)
-    compiler.eval()
+    if args.op == "fold" or (args.op == "inject" and args.rank is not None):
+        compiler = None
+    else:
+        compiler = _prior_compiler(args) if args.prior else load_compiler(args.compiler)
+        compiler.eval()
     with torch.no_grad():
-        if args.op == "inject":
+        if args.op == "inject" and args.rank is not None:
+            from zeroth_grad.lowrank import inject_rank_k
+
+            weights, meta = load_checkpoint(args.ckpt)
+            if args.examples is None or args.head is None:
+                raise SystemExit("rank-k inject needs --examples (with x and y) and --head")
+            x, y = _load_examples(args.examples)
+            if y is None:
+                raise SystemExit("rank-k inject needs labels: --examples must hold {'x', 'y'}")
+            edited = inject_rank_k(weights, x, y, int(args.head), rank=int(args.rank), units=args.units)
+            meta = dict(meta)
+            meta["edit"] = "inject"
+            meta["head"] = str(args.head)
+            meta["rank"] = str(args.rank)
+            meta["h1"] = str(edited["w1"].shape[0])
+            meta["h2"] = str(edited["w2"].shape[0])
+            skills = sorted(set(parse_skills(meta.get("skills", ""))) | {int(args.head)})
+            meta["skills"] = format_skills(skills)
+            save_checkpoint(args.out, edited, meta)
+        elif args.op == "fold":
+            from zeroth_grad.fold import fold_report
+
+            weights, meta = load_checkpoint(args.ckpt)
+            if args.examples is None:
+                raise SystemExit("fold needs --examples: a calibration batch, a tensor or {'x': ...}")
+            x, _ = _load_examples(args.examples)
+            heads = parse_skills(args.heads) if args.heads else parse_skills(meta.get("skills", ""))
+            if not heads:
+                raise SystemExit("fold needs --heads or skills metadata")
+            report = fold_report(weights, x, heads, agreement=args.agreement)
+            meta = dict(meta)
+            meta["edit"] = "fold"
+            save_checkpoint(args.out, report["weights"], meta)
+            print(
+                f"kept {report['kept_h1']}/{report['live_h1_before']} hidden-1 and "
+                f"{report['kept_h2']}/{report['live_h2_before']} hidden-2 units, agreement {report['agreement']:.4f}"
+            )
+        elif args.op == "inject":
             weights, meta = load_checkpoint(args.ckpt)
             phi, head = _load_phi(args, int(weights["w1"].shape[1]))
             edited = compiler.inject(weights, phi, head)
@@ -166,14 +230,29 @@ def _compile(args: argparse.Namespace) -> None:
         elif args.op == "merge":
             paths = _merge_paths(args)
             loaded = [load_checkpoint(path) for path in paths]
-            edited = compiler.merge_many([weights for weights, _ in loaded])
+            heads = [parse_skills(meta.get("skills", "")) for _, meta in loaded] if args.declare_heads else None
+            edited, infos = compiler.merge_many(
+                [weights for weights, _ in loaded],
+                solver=args.solver,
+                expand=args.expand,
+                share=not args.no_share,
+                heads=heads,
+                return_info=True,
+            )
             skills = sorted({skill for _, meta in loaded for skill in parse_skills(meta.get("skills", ""))})
             meta = dict(loaded[0][1])
             meta["edit"] = "merge"
             meta["skills"] = format_skills(skills)
             meta["kind"] = "merged"
             meta["parents"] = str(len(paths))
+            for stale in ("live_h1", "live_h2"):
+                meta.pop(stale, None)
+            meta["h1"] = str(edited["w1"].shape[0])
+            meta["h2"] = str(edited["w2"].shape[0])
             save_checkpoint(args.out, edited, meta)
+            added = sum(info["added_h1"] for info in infos), sum(info["added_h2"] for info in infos)
+            if any(added):
+                print(f"widened by {added[0]} hidden-1 and {added[1]} hidden-2 units to avoid collisions")
         else:
             raise SystemExit(f"unknown compile op {args.op}")
     print(f"wrote {args.out}")
@@ -218,6 +297,22 @@ def main(argv: list[str] | None = None) -> None:
     digits_eval.add_argument("--subsets", type=int, default=20, help="digit subsets sampled per merge size")
     digits_eval.set_defaults(func=_cmd_digits_eval)
 
+    extensions = sub.add_parser("extensions", help="Benchmark Sinkhorn alignment, capacity, rank-k inject, and transformers")
+    extensions.add_argument("--checkpoints", type=Path, default=Path("checkpoints"))
+    extensions.add_argument("--compiler", type=Path, default=Path("runs/compiler.pt"))
+    extensions.add_argument("--digits", type=Path, default=Path("digits"))
+    extensions.add_argument("--digits-w32", type=Path, default=Path("digits_w32"))
+    extensions.add_argument("--digits-dense", type=Path, default=Path("digits_dense"))
+    extensions.add_argument("--widths", type=int, nargs="+", default=[256, 512, 1024, 2048, 4096])
+    extensions.add_argument(
+        "--sections",
+        nargs="+",
+        choices=("alignment", "capacity", "inject", "transformer"),
+        default=["alignment", "capacity", "inject", "transformer"],
+    )
+    extensions.add_argument("--out", type=Path, default=Path("runs/extensions_metrics.json"))
+    extensions.set_defaults(func=_cmd_extensions)
+
     widen = sub.add_parser("widen", help="Duplicate neurons to build a compress input")
     widen.add_argument("--ckpt", type=Path, required=True)
     widen.add_argument("--out", type=Path, required=True)
@@ -229,7 +324,7 @@ def main(argv: list[str] | None = None) -> None:
     widen.set_defaults(func=_cmd_widen)
 
     compile_parser = sub.add_parser("compile", help="Apply a trained compiler to a checkpoint")
-    compile_parser.add_argument("op", choices=("inject", "compress", "merge"))
+    compile_parser.add_argument("op", choices=("inject", "compress", "merge", "fold"))
     compile_parser.add_argument("--compiler", type=Path, default=Path("runs/compiler.pt"))
     compile_parser.add_argument(
         "--prior",
@@ -248,6 +343,18 @@ def main(argv: list[str] | None = None) -> None:
     compile_parser.add_argument("--head", type=int)
     compile_parser.add_argument("--keep-h1", type=int)
     compile_parser.add_argument("--keep-h2", type=int)
+    compile_parser.add_argument("--solver", choices=("hungarian", "sinkhorn", "auto"), default="hungarian")
+    compile_parser.add_argument("--expand", action="store_true", help="merge: widen instead of colliding live units")
+    compile_parser.add_argument("--no-share", action="store_true", help="merge: do not share positively parallel units")
+    compile_parser.add_argument(
+        "--declare-heads",
+        action="store_true",
+        help="merge: give each parent hard ownership of the heads in its skills metadata",
+    )
+    compile_parser.add_argument("--rank", type=int, help="inject: rank-k circuit from --examples instead of rank-1")
+    compile_parser.add_argument("--units", type=int, help="inject --rank: hidden-1 units in the circuit (default: spares)")
+    compile_parser.add_argument("--heads", type=str, help="fold: comma-separated owned heads (default: skills metadata)")
+    compile_parser.add_argument("--agreement", type=float, default=0.99, help="fold: balanced sign agreement to keep")
     compile_parser.set_defaults(func=_compile)
 
     args = parser.parse_args(argv)
