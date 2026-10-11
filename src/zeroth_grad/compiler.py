@@ -243,9 +243,10 @@ class WeightCompiler(nn.Module):
         self,
         weights_a: dict[str, torch.Tensor],
         weights_b: dict[str, torch.Tensor],
+        align_mode: str = "interference",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Return (lam1, lam2, lam3, aligned_b). Each lam is the weight on `a`; lam3 is per output head."""
-        aligned = align_to(weights_a, weights_b)
+        aligned = align_to(weights_a, weights_b, mode=align_mode)
         pair1, pair2, pair3 = self.merge_features(weights_a, aligned)
         prior1 = norm_prior(neuron_norm_h1(weights_a), neuron_norm_h1(aligned)).detach()
         prior2 = norm_prior(neuron_norm_h2(weights_a), neuron_norm_h2(aligned)).detach()
@@ -258,19 +259,28 @@ class WeightCompiler(nn.Module):
         lam3 = torch.sigmoid(torch.nn.functional.softplus(self.head_temp_raw) * owner + raw3)
         return lam1, lam2, lam3, aligned
 
-    def merge(self, weights_a: dict[str, torch.Tensor], weights_b: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def merge(
+        self,
+        weights_a: dict[str, torch.Tensor],
+        weights_b: dict[str, torch.Tensor],
+        align_mode: str = "interference",
+    ) -> dict[str, torch.Tensor]:
         a = clone_weights(weights_a)
         b = clone_weights(weights_b)
-        lam1, lam2, lam3, aligned = self.merge_lambdas(a, b)
+        lam1, lam2, lam3, aligned = self.merge_lambdas(a, b, align_mode=align_mode)
         return mix_checkpoints(a, aligned, lam1, lam2, lam3)
 
-    def merge_many(self, checkpoints: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    def merge_many(
+        self,
+        checkpoints: list[dict[str, torch.Tensor]],
+        align_mode: str = "interference",
+    ) -> dict[str, torch.Tensor]:
         """Fold merge left to right: merge(merge(merge(c0, c1), c2), ...)."""
         if not checkpoints:
             raise ValueError("merge_many needs at least one checkpoint")
         merged = clone_weights(checkpoints[0])
         for other in checkpoints[1:]:
-            merged = self.merge(merged, other)
+            merged = self.merge(merged, other, align_mode=align_mode)
         return merged
 
 
